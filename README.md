@@ -1,3 +1,8 @@
+Elisa Bayu Hendra /233401015
+Yohanes Emmanuel Putra Sutanto /233401017
+
+
+
 ♟️ Chess Multiplayer
 Aplikasi catur multiplayer real-time yang dibangun menggunakan Go (Golang) untuk backend dan HTML/JavaScript untuk frontend. Aplikasi ini memungkinkan dua pemain untuk bermain catur dalam lobby yang berbeda dengan fitur otentikasi, manajemen profil, dan statistik pertandingan.
 
@@ -47,3 +52,4 @@ Untuk menjalankan aplikasi ini secara lokal, Anda memerlukan:
 Go (Golang) versi 1.25.1 atau yang lebih baru.
 
 Akses ke Terminal/Command Prompt.
+
