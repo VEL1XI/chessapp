@@ -13,8 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"strings"
+
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"github.com/notnil/chess"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
@@ -48,6 +52,9 @@ type Lobby struct {
 	Turn        string
 	FEN         string
 	InGame      bool
+	GameEnded   bool
+	MoveHistory []string
+	Game        *chess.Game
 	Clients     map[*websocket.Conn]*Client
 	mutex       sync.RWMutex
 }
@@ -72,10 +79,12 @@ func main() {
 
 	// Initialize lobbies (8 lobbies)
 	for i := 1; i <= 8; i++ {
+		g := chess.NewGame()
 		lobbies[i] = &Lobby{
 			ID:      i,
 			Turn:    "w",
-			FEN:     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+			FEN:     g.Position().String(),
+			Game:    g,
 			Clients: make(map[*websocket.Conn]*Client),
 		}
 	}
@@ -96,6 +105,7 @@ func main() {
 	api.HandleFunc("/user/{id}/stats", getUserStatsHandler).Methods("GET", "OPTIONS")
 	api.HandleFunc("/user-by-username/{username}", getUserByUsernameHandler).Methods("GET", "OPTIONS")
 	api.HandleFunc("/upload-profile-pic", uploadProfilePicHandler).Methods("POST", "OPTIONS")
+	api.HandleFunc("/games/{id}/pgn", getGamePGNHandler).Methods("GET", "OPTIONS")
 
 	// Static files
 	router.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
@@ -156,7 +166,52 @@ func initDB() {
 		log.Fatal(err)
 	}
 
+	// Ensure games table has columns for PGN and game_token (idempotent migration)
+	ensureGameColumns()
+
 	log.Println("✅ Database initialized successfully")
+}
+
+// ensureGameColumns adds missing columns to the games table (pgn, game_token) and a unique index for idempotency
+func ensureGameColumns() {
+	rows, err := db.Query("PRAGMA table_info(games)")
+	if err != nil {
+		log.Printf("❌ Error checking games table schema: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
+			cols[name] = true
+		}
+	}
+
+	if !cols["pgn"] {
+		if _, err := db.Exec("ALTER TABLE games ADD COLUMN pgn TEXT"); err != nil {
+			log.Printf("❌ Error adding pgn column: %v", err)
+		} else {
+			log.Println("✅ Added pgn column to games table")
+		}
+	}
+
+	if !cols["game_token"] {
+		if _, err := db.Exec("ALTER TABLE games ADD COLUMN game_token TEXT"); err != nil {
+			log.Printf("❌ Error adding game_token column: %v", err)
+		} else {
+			log.Println("✅ Added game_token column to games table")
+		}
+	}
+
+	// Create unique index on game_token to enforce idempotency
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_games_game_token ON games(game_token)"); err != nil {
+		log.Printf("❌ Error creating unique index on game_token: %v", err)
+	}
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -326,8 +381,11 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 					lobby.WhitePlayer = ""
 					lobby.BlackPlayer = ""
 					lobby.InGame = false
+					lobby.GameEnded = false
+					// Reset server-side game
+					lobby.Game = chess.NewGame()
+					lobby.FEN = lobby.Game.Position().String()
 					lobby.Turn = "w"
-					lobby.FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 					log.Printf("🔄 Lobby %d reset (empty)", lobby.ID)
 				}
 				lobby.mutex.Unlock()
@@ -356,7 +414,7 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 				client.Color = "black"
 				isReconnect = true
 			} else {
-				// Assign color for new player
+				// Assign color for new player or spectator if both slots filled
 				if lobby.WhitePlayer == "" {
 					lobby.WhitePlayer = username
 					client.Color = "white"
@@ -364,6 +422,9 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 					lobby.BlackPlayer = username
 					client.Color = "black"
 					lobby.InGame = true
+				} else {
+					// Both player slots filled - join as spectator
+					client.Color = "spectator"
 				}
 			}
 
@@ -375,7 +436,7 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 				log.Printf("✅ Player %s joined lobby %d as %s", username, lobby.ID, client.Color)
 			}
 
-			// Send current game state to joining player
+			// Send current game state to joining player (authoritative FEN from server-side game)
 			conn.WriteJSON(WSMessage{
 				Type: "playerJoined",
 				Payload: map[string]interface{}{
@@ -385,7 +446,10 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 						"white_player": lobby.WhitePlayer,
 						"black_player": lobby.BlackPlayer,
 						"turn":         lobby.Turn,
-						"fen":          lobby.FEN,
+						"fen":          lobby.Game.Position().String(),
+						"moves":        lobby.MoveHistory,
+						"inGame":       lobby.InGame,
+						"gameEnded":    lobby.GameEnded,
 					},
 				},
 			})
@@ -402,7 +466,10 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 								"white_player": lobby.WhitePlayer,
 								"black_player": lobby.BlackPlayer,
 								"turn":         lobby.Turn,
-								"fen":          lobby.FEN,
+								"fen":          lobby.Game.Position().String(),
+								"moves":        lobby.MoveHistory,
+								"inGame":       lobby.InGame,
+								"gameEnded":    lobby.GameEnded,
 							},
 						},
 					})
@@ -421,20 +488,70 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 				promotion = p
 			}
 
-			if fen, ok := msg.Payload["fen"].(string); ok {
-				lobby.FEN = fen
+			// 1) Ensure the sender is a known client and it's their turn
+			senderClient := lobby.Clients[conn]
+			if senderClient == nil {
+				log.Printf("⚠️ Unknown client tried to move in lobby %d", lobby.ID)
+				lobby.mutex.Unlock()
+				break
 			}
 
-			// Toggle turn
-			if lobby.Turn == "w" {
-				lobby.Turn = "b"
-			} else {
+			expectedColor := "white"
+			if lobby.Turn == "b" {
+				expectedColor = "black"
+			}
+			if senderClient.Color != expectedColor {
+				// reject move: not sender's turn
+				errMsg := WSMessage{Type: "moveRejected", Payload: map[string]interface{}{"reason": "notYourTurn"}}
+				conn.WriteJSON(errMsg)
+				lobby.mutex.Unlock()
+				break
+			}
+
+			// 2) Prevent immediate duplicate moves (simple dedupe)
+			moveKey := fmt.Sprintf("%s-%s-%s", from, to, promotion)
+			if len(lobby.MoveHistory) > 0 && lobby.MoveHistory[len(lobby.MoveHistory)-1] == moveKey {
+				log.Printf("⚠️ Duplicate move ignored in lobby %d: %s", lobby.ID, moveKey)
+				lobby.mutex.Unlock()
+				break
+			}
+
+			// Build UCI string and validate using server-side chess engine
+			uci := strings.ToLower(from + to)
+			if promotion != "" {
+				uci += strings.ToLower(promotion)
+			}
+
+			notation := chess.UCINotation{}
+			mv, err := notation.Decode(lobby.Game.Position(), uci)
+			if err != nil {
+				log.Printf("⚠️ Illegal move attempt in lobby %d by %s: %s (%v)", lobby.ID, senderClient.Username, uci, err)
+				conn.WriteJSON(WSMessage{Type: "moveRejected", Payload: map[string]interface{}{"reason": "illegalMove"}})
+				lobby.mutex.Unlock()
+				break
+			}
+
+			if err := lobby.Game.Move(mv); err != nil {
+				log.Printf("⚠️ Move application error in lobby %d: %v", lobby.ID, err)
+				conn.WriteJSON(WSMessage{Type: "moveRejected", Payload: map[string]interface{}{"reason": "illegalMove"}})
+				lobby.mutex.Unlock()
+				break
+			}
+
+			// Update canonical FEN and record move
+			lobby.FEN = lobby.Game.Position().String()
+			lobby.MoveHistory = append(lobby.MoveHistory, uci)
+
+			// Update turn from authoritative position
+			if lobby.Game.Position().Turn() == chess.White {
 				lobby.Turn = "w"
+			} else {
+				lobby.Turn = "b"
 			}
 
-			log.Printf("♟️ Move in lobby %d: %s → %s", lobby.ID, from, to)
+			log.Printf("♟️ Move in lobby %d by %s: %s", lobby.ID, senderClient.Username, uci)
 
-			// Broadcast move to all other clients
+			// Broadcast move to all other clients with updated turn and authoritative FEN
 			for c := range lobby.Clients {
 				if c != conn {
 					c.WriteJSON(WSMessage{
@@ -452,22 +569,121 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 				}
 			}
 
+			// Acknowledge move to origin
+			conn.WriteJSON(WSMessage{Type: "moveAccepted", Payload: map[string]interface{}{"from": from, "to": to, "promotion": promotion, "game": map[string]interface{}{"turn": lobby.Turn, "fen": lobby.FEN}}})
+
+			// Check for game end
+			if lobby.Game.Outcome() != chess.NoOutcome {
+				// Determine winner/result
+				outcome := lobby.Game.Outcome()
+				winner := ""
+				result := ""
+				switch outcome {
+				case chess.WhiteWon:
+					winner = "white"
+					result = "white"
+				case chess.BlackWon:
+					winner = "black"
+					result = "black"
+				case chess.Draw:
+					winner = "draw"
+					result = "draw"
+				default:
+					winner = "draw"
+					result = "draw"
+				}
+
+				// Reuse game over handling but guard duplicates
+				if !lobby.GameEnded {
+					// Save game to database with idempotency token and PGN/move list
+					gameToken := uuid.New().String()
+					movesText := strings.Join(lobby.MoveHistory, " ")
+
+					tx, err := db.Begin()
+					if err != nil {
+						log.Printf("❌ Error starting tx to save game: %v", err)
+					} else {
+						_, err = tx.Exec("INSERT INTO games (lobby_id, white_player, black_player, winner, result, pgn, game_token) VALUES (?, ?, ?, ?, ?, ?, ?)",
+							lobby.ID, lobby.WhitePlayer, lobby.BlackPlayer, winner, result, movesText, gameToken)
+						if err != nil {
+							// If unique constraint on game_token triggered, ignore
+							log.Printf("❌ Error inserting game (maybe duplicate): %v", err)
+							tx.Rollback()
+						} else {
+							if err := tx.Commit(); err != nil {
+								log.Printf("❌ Error committing game insert: %v", err)
+							}
+						}
+					}
+
+					// Update user stats
+					if result == "draw" {
+						updateUserStats(lobby.WhitePlayer, "draw")
+						updateUserStats(lobby.BlackPlayer, "draw")
+					} else {
+						winnerUsername := lobby.WhitePlayer
+						loserUsername := lobby.BlackPlayer
+						if winner == "black" {
+							winnerUsername = lobby.BlackPlayer
+							loserUsername = lobby.WhitePlayer
+						}
+
+						updateUserStats(winnerUsername, "win")
+						updateUserStats(loserUsername, "loss")
+					}
+
+					// Broadcast game over to all clients
+					for c := range lobby.Clients {
+						c.WriteJSON(WSMessage{
+							Type: "gameOver",
+							Payload: map[string]interface{}{
+								"winner": winner,
+								"result": result,
+							},
+						})
+					}
+
+					// Mark game ended and mark lobby not in active game state
+					lobby.GameEnded = true
+					lobby.InGame = false
+				}
+			}
+
 			lobby.mutex.Unlock()
 
 		case "gameOver":
 			lobby.mutex.Lock()
+
+			// Ignore duplicate gameOver messages
+			if lobby.GameEnded {
+				log.Printf("⚠️ Duplicate gameOver ignored for lobby %d", lobby.ID)
+				lobby.mutex.Unlock()
+				break
+			}
 
 			winner := msg.Payload["winner"].(string)
 			result := msg.Payload["result"].(string)
 
 			log.Printf("🏁 Game over in lobby %d - Winner: %s, Result: %s", lobby.ID, winner, result)
 
-			// Save game to database
-			_, err := db.Exec("INSERT INTO games (lobby_id, white_player, black_player, winner, result) VALUES (?, ?, ?, ?, ?)",
-				lobby.ID, lobby.WhitePlayer, lobby.BlackPlayer, winner, result)
+			// Save game to database with idempotent token and PGN/moves
+			gameToken := uuid.New().String()
+			movesText := strings.Join(lobby.MoveHistory, " ")
 
+			tx, err := db.Begin()
 			if err != nil {
-				log.Println("❌ Error saving game:", err)
+				log.Printf("❌ Error starting tx to save game: %v", err)
+			} else {
+				_, err = tx.Exec("INSERT INTO games (lobby_id, white_player, black_player, winner, result, pgn, game_token) VALUES (?, ?, ?, ?, ?, ?, ?)",
+					lobby.ID, lobby.WhitePlayer, lobby.BlackPlayer, winner, result, movesText, gameToken)
+				if err != nil {
+					log.Printf("❌ Error inserting game (maybe duplicate): %v", err)
+					tx.Rollback()
+				} else {
+					if err := tx.Commit(); err != nil {
+						log.Printf("❌ Error committing game insert: %v", err)
+					}
+				}
 			}
 
 			// Update user stats
@@ -497,6 +713,10 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 				})
 			}
 
+			// Mark game ended and mark lobby not in active game state
+			lobby.GameEnded = true
+			lobby.InGame = false
+
 			lobby.mutex.Unlock()
 
 		case "rematch":
@@ -520,9 +740,18 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 				}
 			}
 
-			// Reset game
+			// Reset server-side game
+			lobby.Game = chess.NewGame()
 			lobby.Turn = "w"
-			lobby.FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+			lobby.FEN = lobby.Game.Position().String()
+
+			// Reset game ended flag and mark InGame if both players present
+			lobby.GameEnded = false
+			if lobby.WhitePlayer != "" && lobby.BlackPlayer != "" {
+				lobby.InGame = true
+			} else {
+				lobby.InGame = false
+			}
 
 			log.Printf("🔄 Colors swapped: %s (white) vs %s (black)", lobby.WhitePlayer, lobby.BlackPlayer)
 
@@ -540,6 +769,90 @@ func handleWebSocket(conn *websocket.Conn, lobby *Lobby) {
 					},
 				})
 			}
+			// Clear server-side move history
+			lobby.MoveHistory = nil
+
+			lobby.mutex.Unlock()
+
+		case "offerDraw":
+			lobby.mutex.Lock()
+
+			from := msg.Payload["from"].(string)
+			log.Printf("🤝 Draw offer in lobby %d from %s", lobby.ID, from)
+
+			// Broadcast draw offer to all other clients
+			for c := range lobby.Clients {
+				if c != conn {
+					c.WriteJSON(WSMessage{
+						Type: "offerDraw",
+						Payload: map[string]interface{}{
+							"from": from,
+						},
+					})
+				}
+			}
+
+			lobby.mutex.Unlock()
+
+		case "forfeit":
+			lobby.mutex.Lock()
+
+			// Ignore if already handled
+			if lobby.GameEnded {
+				log.Printf("⚠️ Duplicate forfeit ignored for lobby %d", lobby.ID)
+				lobby.mutex.Unlock()
+				break
+			}
+
+			winner := msg.Payload["winner"].(string)
+			forfeitor := msg.Payload["forfeitor"].(string)
+			log.Printf("🚩 Forfeit in lobby %d - %s surrendered to %s", lobby.ID, forfeitor, winner)
+
+			// Save game to database with token and moves text
+			gameToken := uuid.New().String()
+			movesText := strings.Join(lobby.MoveHistory, " ")
+
+			tx, err := db.Begin()
+			if err != nil {
+				log.Printf("❌ Error starting tx to save forfeit game: %v", err)
+			} else {
+				_, err = tx.Exec("INSERT INTO games (lobby_id, white_player, black_player, winner, result, pgn, game_token) VALUES (?, ?, ?, ?, ?, ?, ?)",
+					lobby.ID, lobby.WhitePlayer, lobby.BlackPlayer, winner, winner, movesText, gameToken)
+				if err != nil {
+					log.Printf("❌ Error inserting forfeit game (maybe duplicate): %v", err)
+					tx.Rollback()
+				} else {
+					if err := tx.Commit(); err != nil {
+						log.Printf("❌ Error committing forfeit insert: %v", err)
+					}
+				}
+			}
+
+			// Update user stats
+			winnerUsername := lobby.WhitePlayer
+			loserUsername := lobby.BlackPlayer
+			if winner == "black" {
+				winnerUsername = lobby.BlackPlayer
+				loserUsername = lobby.WhitePlayer
+			}
+
+			updateUserStats(winnerUsername, "win")
+			updateUserStats(loserUsername, "loss")
+
+			// Broadcast forfeit to all clients
+			for c := range lobby.Clients {
+				c.WriteJSON(WSMessage{
+					Type: "gameOver",
+					Payload: map[string]interface{}{
+						"winner": winner,
+						"result": winner,
+					},
+				})
+			}
+
+			// Mark game ended and clear active flag
+			lobby.GameEnded = true
+			lobby.InGame = false
 
 			lobby.mutex.Unlock()
 		}
@@ -777,4 +1090,39 @@ func uploadProfilePicHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	log.Printf("✅ Profile picture uploaded: %s", filename)
+}
+
+func getGamePGNHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var pgn sql.NullString
+	var lobbyID sql.NullInt64
+	var white, black, winner, result string
+	var createdAt string
+
+	err := db.QueryRow("SELECT id, lobby_id, white_player, black_player, winner, result, pgn, created_at FROM games WHERE id = ?", id).
+		Scan(&id, &lobbyID, &white, &black, &winner, &result, &pgn, &createdAt)
+	if err != nil {
+		http.Error(w, `{"error": "Game not found"}`, http.StatusNotFound)
+		return
+	}
+
+	resp := map[string]interface{}{
+		"id":         id,
+		"lobby_id":   lobbyID.Int64,
+		"white":      white,
+		"black":      black,
+		"winner":     winner,
+		"result":     result,
+		"pgn":        nil,
+		"created_at": createdAt,
+	}
+
+	if pgn.Valid {
+		resp["pgn"] = pgn.String
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }

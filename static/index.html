@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Chess Game - Multiplayer</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.css">
+    <link rel="stylesheet" href="/static/styles.css">
     <style>
         * {
             margin: 0;
@@ -381,6 +382,13 @@
             background: #e7f0ff;
         }
 
+        /* Moved inline styles into CSS class to avoid inline style usage */
+        .upload-info {
+            font-size: 14px;
+            color: #999;
+            margin-top: 10px;
+        }
+
         .preview-image {
             max-width: 200px;
             max-height: 200px;
@@ -388,6 +396,10 @@
             margin: 20px auto;
             display: block;
             object-fit: cover;
+        }
+
+        .hidden-input {
+            display: none;
         }
 
         .winrate {
@@ -535,20 +547,20 @@
                     <h2>Edit Profil</h2>
                     
                     <div class="form-group">
-                        <label>Username</label>
                         <input type="text" id="editUsername" placeholder="Username baru">
-                        <button class="btn-success" onclick="updateUsername()" style="margin-top: 10px;">✏️ Update Username</button>
+                        <button class="btn-success btn-update-username" onclick="updateUsername()">✏️ Update Username</button>
                     </div>
-
+                    </div>
+                            <p class="upload-info">Format: JPG, PNG (Max 5MB)</p>
                     <hr class="separator">
 
                     <div class="form-group">
                         <label>Upload Foto Profil</label>
                         <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
                             <p>📷 Klik atau drag & drop untuk upload foto</p>
-                            <p style="font-size: 14px; color: #999; margin-top: 10px;">Format: JPG, PNG (Max 5MB)</p>
+                            <p class="upload-info">Format: JPG, PNG (Max 5MB)</p>
                         </div>
-                        <input type="file" id="fileInput" accept="image/*" style="display: none;" onchange="handleFileSelect(event)">
+                        <input type="file" id="fileInput" accept="image/*" class="hidden-input" onchange="handleFileSelect(event)">
                         <img id="previewImage" class="preview-image hidden" src="" alt="Preview">
                         <button class="btn-success hidden" id="uploadPfpBtn" onclick="updateProfilePic()">📷 Upload Foto Profil</button>
                     </div>
@@ -576,6 +588,8 @@
                     </div>
                     <div id="chessboard"></div>
                     <div class="game-controls">
+                        <button class="btn-secondary" id="offerDrawBtn" onclick="offerDraw()">🤝 Tawarkan Seri</button>
+                        <button class="btn-danger" id="forfeitBtn" onclick="forfeitGame()">🚩 Menyerah</button>
                         <button class="btn-danger" onclick="leaveLobby()">Keluar Lobby</button>
                         <button class="btn-success hidden" id="rematchBtn" onclick="requestRematch()">Rematch</button>
                     </div>
@@ -605,6 +619,8 @@
         let playerColor = null;
         let selectedFile = null;
         let lobbyInterval = null;
+        let gameOverReported = false;
+        let gameResultShown = false;
 
         // Auth Functions
         async function login() {
@@ -954,6 +970,10 @@
             localStorage.setItem('currentLobby', lobbyId);
             localStorage.setItem('currentScreen', 'game');
             
+            // Reset game state flags
+            gameOverReported = false;
+            gameResultShown = false;
+            
             console.log('Joining lobby', lobbyId);
             
             // Clear lobby interval
@@ -997,6 +1017,63 @@
                         playerColor = msg.payload.color;
                         initBoard();
                     }
+                    
+                    // Restore game state from server
+                    if (msg.payload.game) {
+                        const gameData = msg.payload.game;
+                        
+                        // Reset game and load from moves history
+                        game.reset();
+                        
+                        if (gameData.moves && gameData.moves.length > 0) {
+                            // Replay all moves to reconstruct board state
+                            for (let i = 0; i < gameData.moves.length; i++) {
+                                const moveUCI = gameData.moves[i];
+                                // Convert UCI to standard notation for chess.js
+                                const from = moveUCI.substring(0, 2);
+                                const to = moveUCI.substring(2, 4);
+                                const promotion = moveUCI.length > 4 ? moveUCI.substring(4, 5) : '';
+                                
+                                const moveObj = {from: from, to: to};
+                                if (promotion) {
+                                    moveObj.promotion = promotion;
+                                }
+                                
+                                const result = game.move(moveObj);
+                                if (!result) {
+                                    console.warn("Failed to replay move: " + moveUCI);
+                                }
+                            }
+                        }
+                        
+                        // Verify against server FEN
+                        if (gameData.fen && game.fen() !== gameData.fen) {
+                            console.warn("FEN mismatch after replay, loading server FEN directly");
+                            game.load(gameData.fen);
+                        }
+                        
+                        board.position(game.fen());
+                        
+                        // If game has ended, show result
+                        if (gameData.gameEnded && !gameResultShown) {
+                            gameResultShown = true;
+                            gameOverReported = true;
+                            // Server will send gameOver message, but in case we reconnected after game end, check locally
+                            if (game.game_over()) {
+                                let message = '';
+                                if (game.in_checkmate()) {
+                                    const winner = game.turn() === 'w' ? 'black' : 'white';
+                                    message = winner === playerColor ? '🎉 CHECKMATE! Anda Menang!' : '💔 CHECKMATE! Anda Kalah!';
+                                } else if (game.in_draw()) {
+                                    message = '🤝 Permainan Seri!';
+                                }
+                                if (message) {
+                                    showGameOverNotification(message);
+                                }
+                            }
+                        }
+                    }
+                    
                     updatePlayerInfo(msg.payload.game);
                     updateTurnIndicator(msg.payload.game);
                     break;
@@ -1005,7 +1082,34 @@
                     // Handle full game state on reconnect
                     if (msg.payload.game) {
                         const gameData = msg.payload.game;
-                        if (gameData.fen) {
+                        
+                        // Reset and replay moves to reconstruct state
+                        game.reset();
+                        
+                        if (gameData.moves && gameData.moves.length > 0) {
+                            // Replay all moves to reconstruct board state
+                            for (let i = 0; i < gameData.moves.length; i++) {
+                                const moveUCI = gameData.moves[i];
+                                // Convert UCI to standard notation for chess.js
+                                const from = moveUCI.substring(0, 2);
+                                const to = moveUCI.substring(2, 4);
+                                const promotion = moveUCI.length > 4 ? moveUCI.substring(4, 5) : '';
+                                
+                                const moveObj = {from: from, to: to};
+                                if (promotion) {
+                                    moveObj.promotion = promotion;
+                                }
+                                
+                                const result = game.move(moveObj);
+                                if (!result) {
+                                    console.warn("Failed to replay move: " + moveUCI);
+                                }
+                            }
+                        }
+                        
+                        // Verify against server FEN
+                        if (gameData.fen && game.fen() !== gameData.fen) {
+                            console.warn("FEN mismatch after replay, loading server FEN directly");
                             game.load(gameData.fen);
                         }
                         
@@ -1022,6 +1126,24 @@
                             board.position(game.fen());
                         }
                         
+                        // If game has ended, show result
+                        if (gameData.gameEnded && !gameResultShown) {
+                            gameResultShown = true;
+                            gameOverReported = true;
+                            if (game.game_over()) {
+                                let message = '';
+                                if (game.in_checkmate()) {
+                                    const winner = game.turn() === 'w' ? 'black' : 'white';
+                                    message = winner === playerColor ? '🎉 CHECKMATE! Anda Menang!' : '💔 CHECKMATE! Anda Kalah!';
+                                } else if (game.in_draw()) {
+                                    message = '🤝 Permainan Seri!';
+                                }
+                                if (message) {
+                                    showGameOverNotification(message);
+                                }
+                            }
+                        }
+                        
                         updatePlayerInfo(gameData);
                         updateTurnIndicator(gameData);
                     }
@@ -1034,8 +1156,32 @@
                         promotion: msg.payload.promotion || 'q'
                     });
                     board.position(game.fen());
+                    
+                    // Update turn indicator with new game state
                     updateTurnIndicator(msg.payload.game);
+                    
+                    // Update check highlight
+                    $('#chessboard .square-55d63').removeClass('check-square');
+                    if (game.in_check()) {
+                        const color = game.turn();
+                        const kingSquare = findKingSquare(color);
+                        if (kingSquare) {
+                            $('#chessboard .square-' + kingSquare).addClass('check-square');
+                        }
+                    }
+                    
                     checkGameOver();
+                    break;
+
+                case 'moveAccepted':
+                    // Our move was accepted by the server - update FEN from server to stay in sync
+                    if (msg.payload.game && msg.payload.game.fen) {
+                        game.load(msg.payload.game.fen);
+                        board.position(game.fen());
+                        updateTurnIndicator(msg.payload.game);
+                        // Check for game over now that move is confirmed by server
+                        checkGameOver();
+                    }
                     break;
 
                 case 'gameOver':
@@ -1044,6 +1190,14 @@
 
                 case 'rematch':
                     resetGame(msg.payload.game);
+                    break;
+
+                case 'offerDraw':
+                    showDrawOfferDialog(msg.payload.from);
+                    break;
+
+                case 'forfeit':
+                    displayGameResult(msg.payload);
                     break;
 
                 case 'playerLeft':
@@ -1055,7 +1209,83 @@
                     document.getElementById('turnIndicator').innerHTML = 
                         `Menunggu ${msg.payload.username} kembali...`;
                     break;
+
+                case 'moveRejected':
+                    // Server rejected the move - revert the move locally
+                    const reason = msg.payload.reason || 'unknown';
+                    console.log("⚠️ Move rejected: " + reason);
+                    
+                    // Undo the move from our local game state
+                    game.undo();
+                    board.position(game.fen());
+                    
+                    // Show error notification to player
+                    showCheckNotification(`❌ Gerakan ditolak: ${reason}`);
+                    break;
             }
+        }
+
+        function showDrawOfferDialog(from) {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.5);
+                z-index: 10001;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            `;
+
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+                background: white;
+                padding: 30px;
+                border-radius: 15px;
+                text-align: center;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+                max-width: 400px;
+            `;
+
+            dialog.innerHTML = `
+                <h3 style="margin-bottom: 20px; color: #333;">Penawaran Seri dari ${from}</h3>
+                <p style="margin-bottom: 30px; color: #666;">Apakah anda ingin menerima penawaran seri?</p>
+                <div style="display: flex; gap: 15px; justify-content: center;">
+                    <button onclick="acceptDraw()" style="flex: 1; padding: 12px; font-size: 16px; background: #28a745; color: white; border: none; border-radius: 10px; cursor: pointer;">
+                        ✓ Terima
+                    </button>
+                    <button onclick="declineDraw()" style="flex: 1; padding: 12px; font-size: 16px; background: #dc3545; color: white; border: none; border-radius: 10px; cursor: pointer;">
+                        ✗ Tolak
+                    </button>
+                </div>
+            `;
+
+            overlay.appendChild(dialog);
+            overlay.id = 'drawOfferOverlay';
+            document.body.appendChild(overlay);
+        }
+
+        function acceptDraw() {
+            const overlay = document.getElementById('drawOfferOverlay');
+            if (overlay) overlay.remove();
+
+            ws.send(JSON.stringify({
+                type: 'gameOver',
+                payload: {
+                    winner: 'draw',
+                    result: 'draw'
+                }
+            }));
+        }
+
+        function declineDraw() {
+            const overlay = document.getElementById('drawOfferOverlay');
+            if (overlay) overlay.remove();
+
+            showCheckNotification('⚖️ Penawaran seri ditolak');
         }
 
         // Game Functions
@@ -1151,29 +1381,136 @@
         function onDrop(source, target) {
             removeHighlights();
             
+            // Check if it's a pawn promotion
+            const piece = game.get(source);
+            
+            // First, try move WITHOUT temporary promotion to check if it's actually a promotion move
+            const testMove = game.move({
+                from: source,
+                to: target
+            }, {sloppy: false});
+
+            if (testMove === null) {
+                return 'snapback';
+            }
+
+            // Check if pawn reached the last rank (promotion)
+            const targetRank = target.charCodeAt(1) - '1'.charCodeAt(0) + 1;
+            const isPawnPromotion = piece && piece.type === 'p' && (targetRank === 8 || targetRank === 1);
+
+            if (isPawnPromotion) {
+                // Undo the test move
+                game.undo();
+                
+                // Show promotion dialog (will handle move application)
+                showPromotionDialog(source, target);
+                return;
+            }
+
+            // Send move to server
+            // Note: onSnapEnd() will be called by chessboard.js to update the board visually
+            ws.send(JSON.stringify({
+                type: 'move',
+                payload: {
+                    from: source,
+                    to: target,
+                    promotion: '',
+                    fen: game.fen()
+                }
+            }));
+
+            // Update turn indicator immediately after move
+            updateTurnIndicator({ turn: game.turn(), white_player: playerInfo.white_player, black_player: playerInfo.black_player });
+
+            // Don't check game over yet - wait for server to confirm the move via moveAccepted
+        }
+
+        function showPromotionDialog(source, target) {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.5);
+                z-index: 10001;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            `;
+
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+                background: white;
+                padding: 30px;
+                border-radius: 15px;
+                text-align: center;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            `;
+
+            dialog.innerHTML = `
+                <h3 style="margin-bottom: 20px; color: #333;">Pilih Promosi Pion</h3>
+                <div style="display: flex; gap: 15px; justify-content: center;">
+                    <button onclick="promoteAndMove('${source}', '${target}', 'q')" style="padding: 15px 25px; font-size: 24px; background: #667eea; color: white; border: none; border-radius: 10px; cursor: pointer;">
+                        ♕ Ratu
+                    </button>
+                    <button onclick="promoteAndMove('${source}', '${target}', 'r')" style="padding: 15px 25px; font-size: 24px; background: #667eea; color: white; border: none; border-radius: 10px; cursor: pointer;">
+                        ♖ Benteng
+                    </button>
+                    <button onclick="promoteAndMove('${source}', '${target}', 'b')" style="padding: 15px 25px; font-size: 24px; background: #667eea; color: white; border: none; border-radius: 10px; cursor: pointer;">
+                        ♗ Gajah
+                    </button>
+                    <button onclick="promoteAndMove('${source}', '${target}', 'n')" style="padding: 15px 25px; font-size: 24px; background: #667eea; color: white; border: none; border-radius: 10px; cursor: pointer;">
+                        ♘ Kuda
+                    </button>
+                </div>
+            `;
+
+            overlay.appendChild(dialog);
+            overlay.id = 'promotionOverlay';
+            document.body.appendChild(overlay);
+        }
+
+        function promoteAndMove(source, target, promotion) {
+            // Remove overlay
+            const overlay = document.getElementById('promotionOverlay');
+            if (overlay) overlay.remove();
+
             const move = game.move({
                 from: source,
                 to: target,
-                promotion: 'q'
+                promotion: promotion
             });
 
-            if (move === null) return 'snapback';
+            if (move === null) {
+                alert('Invalid move!');
+                return;
+            }
+
+            board.position(game.fen());
 
             ws.send(JSON.stringify({
                 type: 'move',
                 payload: {
                     from: source,
                     to: target,
-                    promotion: 'q',
+                    promotion: promotion,
                     fen: game.fen()
                 }
             }));
 
-            checkGameOver();
+            // Update turn indicator immediately after move
+            updateTurnIndicator({ turn: game.turn(), white_player: playerInfo.white_player, black_player: playerInfo.black_player });
+
+            // Don't check game over yet - wait for server to confirm the move via moveAccepted
         }
 
         function onSnapEnd() {
             board.position(game.fen());
+            
+            // Remove all check highlights first
+            $('#chessboard .square-55d63').removeClass('check-square');
             
             // Highlight king if in check
             if (game.in_check()) {
@@ -1201,6 +1538,12 @@
 
         function checkGameOver() {
             if (game.game_over()) {
+                // Prevent duplicate game-over reporting
+                if (gameOverReported) {
+                    return;
+                }
+                gameOverReported = true;
+
                 let winner = 'draw';
                 let result = 'draw';
                 let message = '';
@@ -1311,8 +1654,8 @@
         }
 
         async function updatePlayerInfo(gameData) {
-            const whitePlayer = gameData.white_player;
-            const blackPlayer = gameData.black_player;
+            const whitePlayer = gameData && gameData.white_player ? gameData.white_player : '';
+            const blackPlayer = gameData && gameData.black_player ? gameData.black_player : '';
             
             let whitePfp = '/uploads/default-avatar.png';
             let blackPfp = '/uploads/default-avatar.png';
@@ -1368,6 +1711,12 @@
         }
 
         function updateTurnIndicator(gameData) {
+            if (!gameData || typeof gameData.turn === 'undefined') {
+                // If no turn info, show waiting state
+                document.getElementById('turnIndicator').innerHTML = `Menunggu pemain...`;
+                return;
+            }
+
             const turn = gameData.turn === 'w' ? 'Putih' : 'Hitam';
             const isMyTurn = (gameData.turn === 'w' && playerColor === 'white') ||
                             (gameData.turn === 'b' && playerColor === 'black');
@@ -1377,6 +1726,12 @@
         }
 
         function displayGameResult(payload) {
+            // Prevent showing the same result twice
+            if (gameResultShown) {
+                return;
+            }
+            gameResultShown = true;
+
             const resultDiv = document.getElementById('gameResult');
             let message = '';
 
@@ -1410,13 +1765,59 @@
             ws.send(JSON.stringify({type: 'rematch'}));
         }
 
+        function offerDraw() {
+            if (game.game_over()) {
+                showCheckNotification('⚠️ Permainan sudah selesai');
+                return;
+            }
+
+            ws.send(JSON.stringify({
+                type: 'offerDraw',
+                payload: {
+                    from: currentUser.username
+                }
+            }));
+
+            showCheckNotification('⚖️ Penawaran seri dikirim...');
+        }
+
+        function forfeitGame() {
+            if (game.game_over()) {
+                showCheckNotification('⚠️ Permainan sudah selesai');
+                return;
+            }
+
+            const confirmed = confirm('Apakah anda yakin ingin menyerah?');
+            if (!confirmed) return;
+
+            const winner = playerColor === 'white' ? 'black' : 'white';
+            
+            ws.send(JSON.stringify({
+                type: 'forfeit',
+                payload: {
+                    winner: winner,
+                    result: winner,
+                    forfeitor: currentUser.username
+                }
+            }));
+
+            showCheckNotification('🚩 Anda telah menyerah');
+        }
+
         function resetGame(gameData) {
             // Remove any overlays
             const overlay = document.getElementById('gameOverOverlay');
             if (overlay) overlay.remove();
             
             game = new Chess();
-            board.start();
+            // If board not initialized (edge case), initialize it; otherwise restart
+            if (!board) {
+                initBoard();
+            } else if (board && typeof board.start === 'function') {
+                board.start();
+            }
+            gameOverReported = false;
+            gameResultShown = false;
             
             // Swap colors for rematch
             if (gameData.white_player === currentUser.username) {
@@ -1436,6 +1837,13 @@
         function leaveLobby() {
             console.log('Leaving lobby', currentLobby);
             
+            // Remove any overlays
+            const overlay = document.getElementById('gameOverOverlay');
+            if (overlay) overlay.remove();
+            
+            const promotionOverlay = document.getElementById('promotionOverlay');
+            if (promotionOverlay) promotionOverlay.remove();
+            
             if (ws) {
                 ws.close();
                 ws = null;
@@ -1446,6 +1854,8 @@
             board = null;
             game = new Chess();
             playerColor = null;
+            gameOverReported = false;
+            gameResultShown = false;
             
             // Clear localStorage
             localStorage.removeItem('currentLobby');
